@@ -11,25 +11,41 @@ import os.lock
 import Foundation
 
 public final class ImageDownloader {
-    public typealias DownloadTask = ImageDownloadTask
-    public typealias DownloadResult = ImageDownloadResult
-
     public let session: URLSession
-    private(set) weak var delegate: ImageDownloaderDelegate?
+    
+    public var delegate: ImageDownloaderDelegate? {
+        get {
+            if delegateQueue == .main && Thread.isMainThread {
+                return weakDelegate
+            } else {
+                return delegateQueue.sync { weakDelegate }
+            }
+        }
+        
+        set {
+            if delegateQueue == .main && Thread.isMainThread {
+                weakDelegate = newValue
+            } else {
+                delegateQueue.sync { weakDelegate = newValue }
+            }
+        }
+    }
     
     private var taskRegistry = TaskRegistry()
+    
+    private let processQueue: DispatchQueue
     private let delegateQueue: DispatchQueue
-    private let processingQueue: DispatchQueue
     private let sessionDelegate: URLSessionDelegateProxy
+    
+    private weak var weakDelegate: ImageDownloaderDelegate?
 
     public init(
         sessionConfiguration: URLSessionConfiguration,
         delegate: ImageDownloaderDelegate? = nil,
         delegateQueue: DispatchQueue = .main
     ) {
-        let sessionDelegate = URLSessionDelegateProxy()
-        
         let delegateOperationQueue: OperationQueue
+        
         if delegateQueue === DispatchQueue.main {
             delegateOperationQueue = .main
         } else {
@@ -37,78 +53,27 @@ public final class ImageDownloader {
             delegateOperationQueue.underlyingQueue = delegateQueue
         }
         
+        let sessionDelegate = URLSessionDelegateProxy()
+        
         let session = URLSession(
             configuration: sessionConfiguration,
-            delegate: sessionDelegate,
+            delegate:      sessionDelegate,
             delegateQueue: delegateOperationQueue
         )
         session.sessionDescription = "com.uncosmos.WebImage.ImageDownloader"
 
-        let processingQueue = DispatchQueue(
-            label: "com.uncosmos.WebImage.ImageDownloader.processing",
+        let processQueue = DispatchQueue(
+            label: "com.uncosmos.WebImage.ImageDownloader.Process",
             attributes: .concurrent
         )
 
         self.session = session
-        self.delegate = delegate
+        self.weakDelegate = delegate
         self.delegateQueue = delegateQueue
-        self.processingQueue = processingQueue
+        self.processQueue = processQueue
         self.sessionDelegate = sessionDelegate
         
         sessionDelegate.downloader = self
-    }
-    
-    public func downloadImage(
-        at url: URL,
-        decoding decodingHandler: DownloadTask.DecodingHandler? = nil,
-        transform transformHandler: DownloadTask.TransformHandler? = nil,
-        completion completionHandler: DownloadTask.CompletionHandler? = nil
-    ) -> URLSessionDataTask {
-        let downloadTask = DownloadTask(
-            decoding: decodingHandler,
-            transform: transformHandler,
-            completion: completionHandler,
-            dataTask: session.dataTask(with: url)
-        )
-        
-        taskRegistry.addTask(downloadTask)
-        return downloadTask.dataTask
-    }
-    
-    public func downloadImage(
-        with urlRequest: URLRequest,
-        decoding decodingHandler: DownloadTask.DecodingHandler? = nil,
-        transform transformHandler: DownloadTask.TransformHandler? = nil,
-        completion completionHandler: DownloadTask.CompletionHandler? = nil
-    ) -> URLSessionDataTask {
-        let downloadTask = DownloadTask(
-            decoding: decodingHandler,
-            transform: transformHandler,
-            completion: completionHandler,
-            dataTask: session.dataTask(with: urlRequest)
-        )
-        
-        taskRegistry.addTask(downloadTask)
-        return downloadTask.dataTask
-    }
-
-    public func invalidate(allowFinishingOutstandingTasks shouldAllow: Bool) {
-        if shouldAllow {
-            session.finishTasksAndInvalidate()
-        } else {
-            session.invalidateAndCancel()
-            taskRegistry.removeAllTasks()
-            
-            if delegateQueue === DispatchQueue.main && Thread.isMainThread {
-                sessionDelegate.downloader = nil
-                delegate = nil
-            } else {
-                delegateQueue.sync {
-                    sessionDelegate.downloader = nil
-                    delegate = nil
-                }
-            }
-        }
     }
     
     deinit {
@@ -116,140 +81,171 @@ public final class ImageDownloader {
     }
 }
 
-// MARK: - URLSessionDataDelegate
-private extension ImageDownloader {
+// MARK: - Creating Image Download Tasks
+
+public extension ImageDownloader {
+    @_inlineable
+    func downloadTask(
+        with request: URLRequest,
+        progress progressHandler: ImageDownloadTask.ProgressHandler? = nil,
+        decoding decodingHandler: ImageDownloadTask.DecodingHandler? = nil,
+        transform transformHandler: ImageDownloadTask.TransformHandler? = nil,
+        completion completionHandler: ImageDownloadTask.CompletionHandler? = nil
+    ) -> ImageDownloadTask {
+        return AnyImageDownloadTask(
+            request:    request,
+            downloader: self,
+            progress:   progressHandler,
+            decoding:   decodingHandler,
+            transform:  transformHandler,
+            completion: completionHandler
+        )
+    }
+    
+    @_inlineable
+    func downloadTask(
+        at url: URL,
+        progress progressHandler: ImageDownloadTask.ProgressHandler? = nil,
+        decoding decodingHandler: ImageDownloadTask.DecodingHandler? = nil,
+        transform transformHandler: ImageDownloadTask.TransformHandler? = nil,
+        completion completionHandler: ImageDownloadTask.CompletionHandler? = nil
+    ) -> ImageDownloadTask {
+        return AnyImageDownloadTask(
+            request:    URLRequest(url: url),
+            downloader: self,
+            progress:   progressHandler,
+            decoding:   decodingHandler,
+            transform:  transformHandler,
+            completion: completionHandler
+        )
+    }
+}
+
+// MARK: - Internal Methods
+
+extension ImageDownloader {
+    func addTask(_ downloadTask: ImageDownloadTask) {
+        taskRegistry.addTask(downloadTask)
+    }
+    
+    func didFinishDownloadingImage(for downloadTask: ImageDownloadTask, with error: NSError?) {
+        if let delegate = weakDelegate, let url = downloadTask.url {
+            delegate.imageDownloader(self, didFinishDownloadingImageAt: url, with: error, for: downloadTask)
+        }
+        
+        if let error = error {
+            if error.domain == NSURLErrorDomain, error.code == NSURLErrorCancelled {
+                downloadTask.complete(with: .cancelled)
+            } else {
+                downloadTask.complete(with: .failed(error))
+            }
+        } else if let imageData = downloadTask.imageData, !imageData.isEmpty {
+            processQueue.async { [weak self] in
+                self?.processImage(for: downloadTask, with: imageData)
+            }
+        } else {
+            downloadTask.complete(with: .noData)
+        }
+    }
+    
+    func processImage(for downloadTask: ImageDownloadTask, with imageData: Data) {
+        func cancelIfNeeded() -> Bool {
+            if downloadTask.dataTask.state == .canceling {
+                delegateQueue.async {
+                    downloadTask.complete(with: .cancelled)
+                }
+                return true
+            } else {
+                return false
+            }
+        }
+        
+        if cancelIfNeeded() { return }
+        
+        guard var image = downloadTask.decode(imageData) else {
+            if cancelIfNeeded() { return }
+            
+            return delegateQueue.async {
+                downloadTask.complete(with: .badData(imageData))
+            }
+        }
+        
+        if cancelIfNeeded() { return }
+        
+        if let transformed = downloadTask.transform(image) {
+            if cancelIfNeeded() { return }
+            image = transformed
+        }
+        
+        delegateQueue.async { [weak self] in
+            if let sself = self, let delegate = sself.weakDelegate, let url = downloadTask.url {
+                delegate.imageDownloader(sself, didDownload: image, at: url, for: downloadTask)
+            }
+            
+            downloadTask.complete(with: .succeeded(image, from: imageData))
+        }
+    }
+}
+
+// MARK: - Conforming to URLSessionDataDelegate via Proxy
+
+extension ImageDownloader {
     class URLSessionDelegateProxy : NSObject, URLSessionDataDelegate {
         weak var downloader: ImageDownloader?
         
         func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
             if let downloader = downloader {
-                downloader.taskRegistry.removeAllTasks()
-                downloader.delegate = nil
                 self.downloader = nil
+                
+                downloader.taskRegistry.removeAllTasks()
+                downloader.weakDelegate = nil
+            }
+        }
+        
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            guard let downloader = downloader else {
+                return completionHandler(.cancel)
+            }
+            
+            if
+                let delegate = downloader.weakDelegate,
+                let url = dataTask.originalRequest?.url,
+                let downloadTask = downloader.taskRegistry.task(forIdentifier: dataTask.taskIdentifier),
+                !delegate.imageDownloader(downloader, shouldDownloadImageAt: url, with: response, for: downloadTask)
+            {
+                return completionHandler(.cancel)
+            } else {
+                return completionHandler(.allow)
             }
         }
         
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-            guard let task = downloader?.taskRegistry.task(forIdentifier: dataTask.taskIdentifier) else {
-                return
+            if let downloadTask = downloader?.taskRegistry.task(forIdentifier: dataTask.taskIdentifier) {
+                downloadTask.receive(data)
             }
-            
-            task.recevie(data)
         }
         
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             guard
                 let downloader = downloader,
-                let url = task.originalRequest?.url,
                 let downloadTask = downloader.taskRegistry.removeTask(forIdentifier: task.taskIdentifier)
             else {
                 return
             }
             
-            switch (error, downloadTask.data) {
-            case (.some(let error as NSError), _):
-                let completionHandler = downloadTask.completionHandler
-                
-                downloader.delegateQueue.async { [weak downloader, completionHandler, url, error] in
-                    guard let downloader = downloader else { return }
-                    
-                    if error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled {
-                        downloader.delegate?.imageDownloader(downloader, didCancelDownloadingImageAt: url)
-                        completionHandler?(.cancelled, url)
-                    } else {
-                        downloader.delegate?.imageDownloader(downloader, didFailToDownloadImageAt: url, with: error)
-                        completionHandler?(.networkError(error), url)
-                    }
-                }
-            case (.none, .some):
-                downloader.processingQueue.async { [weak downloader, downloadTask] in
-                    guard
-                        let downloader = downloader,
-                        let url = downloadTask.dataTask.originalRequest?.url
-                    else { return }
-                    
-                    let completionHandler = downloadTask.completionHandler
-                    
-                    // Guard that the data task is not cancelled during decoding/transforming process.
-                    func notifyCancellationIfNeeded() -> Bool {
-                        if downloadTask.dataTask.state == .canceling {
-                            downloader.delegateQueue.async { [weak downloader, completionHandler, url] in
-                                guard let downloader = downloader else { return }
-                                
-                                downloader.delegate?.imageDownloader(downloader, didCancelDownloadingImageAt: url)
-                                completionHandler?(.cancelled, url)
-                            }
-                            return true
-                        } else {
-                            return false
-                        }
-                    }
-                    
-                    if notifyCancellationIfNeeded() { return }
-                    
-                    // Decode image data
-                    let imageData = downloadTask.data! as Data
-                    
-                    var imageIfDecoded: UIImage?
-                    if let decodingHandler = downloadTask.decodingHandler {
-                        imageIfDecoded = decodingHandler(imageData, url)
-                    } else {
-                        imageIfDecoded = UIImage(data: imageData)
-                    }
-                    
-                    if notifyCancellationIfNeeded() { return }
-                    
-                    // Failed to decode image data
-                    guard var image = imageIfDecoded else {
-                        return downloader.delegateQueue.async { [weak downloader, completionHandler, url, imageData] in
-                            guard let downloader = downloader else { return }
-                            
-                            downloader.delegate?.imageDownloader(
-                                downloader,
-                                didFailToDecodeImageDataAt: url,
-                                with: imageData
-                            )
-                            completionHandler?(.undecodableData(imageData), url)
-                        }
-                    }
-                    
-                    // Transform image if needed
-                    if let transformHandler = downloadTask.transformHandler {
-                        image = transformHandler(image, url)
-                        
-                        if notifyCancellationIfNeeded() { return }
-                    }
-                    
-                    // Notify delegate and completion handler
-                    return downloader.delegateQueue.async {
-                        [weak downloader, completionHandler, url, image, imageData] in
-                        guard let downloader = downloader else { return }
-                        
-                        downloader.delegate?.imageDownloader(
-                            downloader,
-                            didDownload: image,
-                            decodedFrom: imageData,
-                            at: url
-                        )
-                        completionHandler?(.decoded(image, from: imageData), url)
-                    }
-                }
-            default:
-                let completionHandler = downloadTask.completionHandler
-                
-                downloader.delegateQueue.async { [weak downloader, completionHandler, url] in
-                    guard let downloader = downloader else { return }
-                    
-                    downloader.delegate?.imageDownloader(downloader, didFailToDecodeImageDataAt: url, with: nil)
-                    completionHandler?(.missingData, url)
-                }
-            }
+            downloader.didFinishDownloadingImage(for: downloadTask, with: error as NSError?)
         }
     }
 }
 
-// MARK: - TaskRegistry
-private extension ImageDownloader {
+// MARK: - Supporting Types
+
+extension ImageDownloader {
     struct TaskRegistry {
         private var tasks = [Int : ImageDownloadTask]()
         
@@ -267,28 +263,34 @@ private extension ImageDownloader {
         
         mutating func addTask(_ task: ImageDownloadTask) {
             beginAccessing()
-            tasks[task.dataTask.taskIdentifier] = task
+            let oldTask = tasks.updateValue(task, forKey: task.dataTask.taskIdentifier)
             endAccessing()
+            
+            assert(oldTask == nil, "Duplicate task.")
         }
         
         mutating func removeTask(forIdentifier taskIdentifier: Int) -> ImageDownloadTask? {
             beginAccessing()
             defer { endAccessing() }
+            
             return tasks.removeValue(forKey: taskIdentifier)
         }
         
         mutating func removeAllTasks() {
             beginAccessing()
             defer { endAccessing() }
+            
             tasks.removeAll()
         }
         
         mutating func task(forIdentifier taskIdentifier: Int) -> ImageDownloadTask? {
             beginAccessing()
             defer { endAccessing() }
+            
             return tasks[taskIdentifier]
         }
         
+        @inline(__always)
         private mutating func beginAccessing() {
         #if DEBUG
             lock.lock()
@@ -297,6 +299,7 @@ private extension ImageDownloader {
         #endif
         }
         
+        @inline(__always)
         private mutating func endAccessing() {
         #if DEBUG
             lock.unlock()

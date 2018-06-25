@@ -27,10 +27,10 @@ class WebImageTests: XCTestCase {
         let imageURL = URL(string: "https://assets-cdn.github.com/images/icons/twitter.png")!
         let expectation = self.expectation(description: "Should download image from valid image url: \(imageURL)")
         
-        downloader.downloadImage(at: imageURL) { result, sourceURL in
+        downloader.downloadTask(at: imageURL) { result, url in
             switch result {
-            case .decoded(let image, from: _):
-                print("Successfully downloaded image: \(image) from: \(sourceURL)")
+            case .succeeded(let image, _):
+                print("Successfully downloaded image: \(image) from: \(url)")
                 expectation.fulfill()
             case .cancelled:
                 XCTAssert(false, "Task should not be cancelled.")
@@ -46,10 +46,10 @@ class WebImageTests: XCTestCase {
         let imageURL = URL(string: "https://assets-cdn.github.com/images/icons/invalid.png")!
         let expectation = self.expectation(description: "Should not download image from invalid image url: \(imageURL)")
         
-        downloader.downloadImage(at: imageURL) { result, sourceURL in
+        downloader.downloadTask(at: imageURL) { result, url in
             switch result {
-            case .decoded:
-                XCTAssert(false, "Should not be able to download image from invalid image url: \(sourceURL)")
+            case .succeeded(let image, _):
+                XCTAssert(false, "Should not be able to download image from invalid image url: \(image), \(url)")
             case .cancelled:
                 XCTAssert(false, "Task should not be cancelled.")
             default:

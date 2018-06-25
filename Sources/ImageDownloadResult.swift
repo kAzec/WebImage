@@ -10,11 +10,10 @@ import UIKit
 import Foundation
 
 public enum ImageDownloadResult {
+    case failed(NSError)
     case cancelled
-    case networkError(NSError)
     
-    case missingData
-    case undecodableData(Data)
-    
-    case decoded(UIImage, from: Data)
+    case noData
+    case badData(Data)
+    case succeeded(UIImage, from: Data)
 }

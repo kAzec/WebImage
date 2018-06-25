@@ -9,48 +9,106 @@
 import UIKit
 import Foundation
 
-public final class ImageDownloadTask {
-    public typealias DecodingHandler = (_ data: Data, _ sourceURL: URL) -> UIImage?
-    public typealias TransformHandler = (_ image: UIImage, _ sourceURL: URL) -> UIImage
-    public typealias CompletionHandler = (_ result: ImageDownloadResult, _ sourceURL: URL) -> Void
+open class ImageDownloadTask {
+    public final let dataTask: URLSessionDataTask
+    public final var imageData: Data?
     
-    var data: NSMutableData?
+    public final var url: URL? {
+        return dataTask.originalRequest?.url
+    }
     
+    public init(request: URLRequest, downloader: ImageDownloader) {
+        self.dataTask = downloader.session.dataTask(with: request)
+        
+        downloader.addTask(self)
+    }
+    
+    public convenience init(url: URL, downloader: ImageDownloader) {
+        self.init(request: URLRequest(url: url), downloader: downloader)
+    }
+    
+    open func suspend() {
+        dataTask.suspend()
+    }
+    
+    open func resume() {
+        dataTask.resume()
+    }
+    
+    open func cancel() {
+        dataTask.cancel()
+    }
+    
+    open func receive(_ data: Data) {
+        if imageData?.append(data) == nil {
+            let count = data.count
+            imageData = data.withUnsafeBytes { bytes in
+                Data(bytes: bytes, count: count)
+            }
+        }
+    }
+    
+    open func decode(_ data: Data) -> UIImage? {
+        return UIImage(data: data)
+    }
+    
+    open func transform(_ image: UIImage) -> UIImage? {
+        return nil
+    }
+    
+    open func complete(with result: ImageDownloadResult) { }
+}
+
+@_versioned
+final class AnyImageDownloadTask : ImageDownloadTask {
+    let progressHandler: ProgressHandler?
     let decodingHandler: DecodingHandler?
     let transformHandler: TransformHandler?
     let completionHandler: CompletionHandler?
     
-    public let dataTask: URLSessionDataTask
-    
+    @_versioned
     init(
-        decoding: DecodingHandler?,
-        transform: TransformHandler?,
-        completion: CompletionHandler?,
-        dataTask: URLSessionDataTask
+        request: URLRequest,
+        downloader: ImageDownloader,
+        progress progressHandler: ProgressHandler?,
+        decoding decodingHandler: DecodingHandler?,
+        transform transformHandler: TransformHandler?,
+        completion completionHandler: CompletionHandler?
     ) {
-        decodingHandler = decoding
-        transformHandler = transform
-        completionHandler = completion
-        self.dataTask = dataTask
+        self.progressHandler = progressHandler
+        self.decodingHandler = decodingHandler
+        self.transformHandler = transformHandler
+        self.completionHandler = completionHandler
+        
+        super.init(request: request, downloader: downloader)
     }
     
-    public func suspend() {
-        dataTask.suspend()
-    }
-    
-    public func resume() {
-        dataTask.resume()
-    }
-    
-    public func cancel() {
-        dataTask.cancel()
-    }
-    
-    func recevie(_ data: Data) {
-        if let receivedData = self.data {
-            receivedData.append(data)
-        } else {
-            self.data = NSMutableData(data: data)
+    override func receive(_ data: Data) {
+        super.receive(data)
+        
+        if let data = imageData, let handler = progressHandler {
+            handler(data, url)
         }
     }
+    
+    override func decode(_ data: Data) -> UIImage? {
+        return decodingHandler?(data, url) ?? super.decode(data)
+    }
+    
+    override func transform(_ image: UIImage) -> UIImage? {
+        return transformHandler?(image, url)
+    }
+    
+    override func complete(with result: ImageDownloadResult) {
+        completionHandler?(result, url)
+    }
+}
+
+// MARK: - Type Aliases
+
+public extension ImageDownloadTask {
+    typealias ProgressHandler = (_ data: Data, _ url: URL?) -> Void
+    typealias DecodingHandler = (_ data: Data, _ url: URL?) -> UIImage?
+    typealias TransformHandler = (_ image: UIImage, _ url: URL?) -> UIImage
+    typealias CompletionHandler = (_ result: ImageDownloadResult, _ url: URL?) -> Void
 }

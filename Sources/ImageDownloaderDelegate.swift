@@ -10,19 +10,52 @@ import UIKit
 import Foundation
 
 public protocol ImageDownloaderDelegate : class {
-    func imageDownloader(_ downloader: ImageDownloader, didCancelDownloadingImageAt url: URL)
-    func imageDownloader(_ downloader: ImageDownloader, didFailToDownloadImageAt url: URL, with error: NSError)
-    func imageDownloader(_ downloader: ImageDownloader, didFailToDecodeImageDataAt url: URL, with data: Data?)
+    func imageDownloader(
+        _ downloader: ImageDownloader,
+        shouldDownloadImageAt url: URL,
+        with response: URLResponse,
+        for task: ImageDownloadTask
+    ) -> Bool
+    
+    func imageDownloader(
+        _ downloader: ImageDownloader,
+        didFinishDownloadingImageAt url: URL,
+        with error: NSError?,
+        for task: ImageDownloadTask
+    )
+    
     func imageDownloader(
         _ downloader: ImageDownloader,
         didDownload image: UIImage,
-        decodedFrom data: Data,
-        at url: URL
+        at url: URL,
+        for task: ImageDownloadTask
     )
 }
 
-extension ImageDownloaderDelegate {
-    func imageDownloader(_ downloader: ImageDownloader, didCancelDownloadingImageAt url: URL) { }
-    func imageDownloader(_ downloader: ImageDownloader, didFailToDownloadImageAt url: URL, with error: NSError) { }
+// MARK: - Providing Default Implementations
+
+public extension ImageDownloaderDelegate {
+    func imageDownloader(
+        _ downloader: ImageDownloader,
+        shouldDownloadImageAt url: URL,
+        with response: URLResponse,
+        for task: ImageDownloadTask
+    ) -> Bool {
+        return true
+    }
+    
+    func imageDownloader(
+        _ downloader: ImageDownloader,
+        didFinishDownloadingImageAt url: URL,
+        with error: NSError?,
+        for task: ImageDownloadTask
+    ) { }
+    
+    func imageDownloader(
+        _ downloader: ImageDownloader,
+        didDownload image: UIImage,
+        at url: URL,
+        for task: ImageDownloadTask
+    ) { }
 }
 
