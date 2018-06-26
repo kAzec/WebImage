@@ -27,10 +27,6 @@ open class ImageDownloadTask {
         self.init(request: URLRequest(url: url), downloader: downloader)
     }
     
-    open func suspend() {
-        dataTask.suspend()
-    }
-    
     open func resume() {
         dataTask.resume()
     }

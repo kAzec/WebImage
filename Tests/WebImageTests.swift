@@ -25,7 +25,7 @@ class WebImageTests: XCTestCase {
     
     func testDownloadAtValidImageURL() {
         let imageURL = URL(string: "https://assets-cdn.github.com/images/icons/twitter.png")!
-        let expectation = self.expectation(description: "Should download image from valid image url: \(imageURL)")
+        let expectation = self.expectation(description: "Should download image at \(imageURL)")
         
         downloader.downloadTask(at: imageURL) { result, url in
             switch result {
@@ -39,12 +39,12 @@ class WebImageTests: XCTestCase {
             }
         }.resume()
         
-        wait(for: [expectation], timeout: 5)
+        wait(for: [expectation], timeout: 20.0)
     }
     
     func testDownloadAtInvalidImageURL() {
-        let imageURL = URL(string: "https://assets-cdn.github.com/images/icons/invalid.png")!
-        let expectation = self.expectation(description: "Should not download image from invalid image url: \(imageURL)")
+        let imageURL = URL(string: "https://invalid-host/invalid-image.png")!
+        let expectation = self.expectation(description: "Should not download image at \(imageURL)")
         
         downloader.downloadTask(at: imageURL) { result, url in
             switch result {
@@ -57,6 +57,6 @@ class WebImageTests: XCTestCase {
             }
         }.resume()
         
-        wait(for: [expectation], timeout: 5)
+        wait(for: [expectation], timeout: 20.0)
     }
 }
